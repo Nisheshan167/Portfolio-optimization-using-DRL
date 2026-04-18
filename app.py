@@ -75,6 +75,19 @@ def get_return_inputs(prices):
 
     return returns, annual_returns, annual_cov
 
+ASSETS = ["XLK", "XLF", "XLV", "XLE", "XLY", "EEM", "LQD", "IEF", "VNQ", "GLD", "SHY"]
+
+ASSET_CLASS_GROUPS = {
+    "Equity": [0, 1, 2, 3, 4, 5],   # XLK, XLF, XLV, XLE, XLY, EEM
+    "Corporate Debt": [6],          # LQD
+    "Government Debt": [7],         # IEF
+    "Real Estate": [8],             # VNQ
+    "Gold": [9],                    # GLD
+    "Cash": [10]                    # SHY
+}
+
+MIN_CLASS_WEIGHT = 0.02
+
 # -----------------------------
 # PORTFOLIO FUNCTIONS
 # -----------------------------
@@ -98,8 +111,14 @@ def max_return_for_target_risk(annual_returns, annual_cov, target_risk):
 
     constraints = [
         {"type": "eq", "fun": lambda w: np.sum(w) - 1},
-        {"type": "eq", "fun": lambda w: portfolio_volatility(w, annual_cov) - target_risk}
+        {"type": "eq", "fun": lambda w: portfolio_volatility(w, annual_cov) - target_risk},
     ]
+
+    # Minimum 2% in each asset class
+    for _, idxs in ASSET_CLASS_GROUPS.items():
+        constraints.append(
+            {"type": "ineq", "fun": lambda w, idxs=idxs: np.sum(w[idxs]) - MIN_CLASS_WEIGHT}
+        )
 
     result = minimize(
         lambda w: -portfolio_return(w, annual_returns),
@@ -117,8 +136,14 @@ def min_risk_for_target_return(annual_returns, annual_cov, target_return):
 
     constraints = [
         {"type": "eq", "fun": lambda w: np.sum(w) - 1},
-        {"type": "eq", "fun": lambda w: portfolio_return(w, annual_returns) - target_return}
+        {"type": "eq", "fun": lambda w: portfolio_return(w, annual_returns) - target_return},
     ]
+
+    # Minimum 2% in each asset class
+    for _, idxs in ASSET_CLASS_GROUPS.items():
+        constraints.append(
+            {"type": "ineq", "fun": lambda w, idxs=idxs: np.sum(w[idxs]) - MIN_CLASS_WEIGHT}
+        )
 
     result = minimize(
         lambda w: portfolio_volatility(w, annual_cov),
