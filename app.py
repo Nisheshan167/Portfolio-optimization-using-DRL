@@ -9,6 +9,18 @@ st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
 ASSETS = ["XLK", "XLF", "XLV", "XLE", "XLY", "EEM", "LQD", "IEF", "VNQ", "GLD", "SHY"]
 
+ASSET_CLASS_GROUPS = {
+    "Equity": [0, 1, 2, 3, 4, 5],   # XLK, XLF, XLV, XLE, XLY, EEM
+    "Corporate Debt": [6],          # LQD
+    "Government Debt": [7],         # IEF
+    "Real Estate": [8],             # VNQ
+    "Gold": [9],                    # GLD
+    "Cash": [10]                    # SHY
+}
+
+MIN_CLASS_WEIGHT = 0.02
+
+
 # -----------------------------
 # DATA
 # -----------------------------
@@ -22,47 +34,55 @@ def download_prices(assets, start_date, end_date):
         progress=False
     )
 
-    # Case 1: MultiIndex columns
+    if data.empty:
+        raise ValueError("No data returned from Yahoo Finance.")
+
+    # MultiIndex columns
     if isinstance(data.columns, pd.MultiIndex):
         level0 = list(data.columns.get_level_values(0))
         level1 = list(data.columns.get_level_values(1))
 
-        # Format like: ('Ticker', 'Close')
         if "Close" in level1:
             prices = data.xs("Close", axis=1, level=1)
-
-        # Format like: ('Close', 'Ticker')
         elif "Close" in level0:
             prices = data.xs("Close", axis=1, level=0)
-
+        elif "Adj Close" in level1:
+            prices = data.xs("Adj Close", axis=1, level=1)
+        elif "Adj Close" in level0:
+            prices = data.xs("Adj Close", axis=1, level=0)
         else:
-            raise ValueError(f"'Close' not found in MultiIndex columns: {data.columns}")
+            raise ValueError(f"'Close' or 'Adj Close' not found in MultiIndex columns: {data.columns}")
 
-    # Case 2: Single-level columns
+    # Single-level columns
     else:
         if "Close" in data.columns:
             prices = data[["Close"]].copy()
-
-            # If only one asset, rename Close -> ticker
-            if len(assets) == 1:
-                prices.columns = assets
+        elif "Adj Close" in data.columns:
+            prices = data[["Adj Close"]].copy()
         else:
-            raise ValueError(f"'Close' not found in columns: {data.columns}")
+            raise ValueError(f"'Close' or 'Adj Close' not found in columns: {data.columns}")
 
-    # Keep only requested assets that actually exist
+        # single asset rename
+        if len(assets) == 1:
+            prices.columns = assets
+
     available_assets = [a for a in assets if a in prices.columns]
     missing_assets = [a for a in assets if a not in prices.columns]
 
     if missing_assets:
         st.warning(f"These assets were not returned and were skipped: {missing_assets}")
 
-    prices = prices[available_assets]
+    if len(available_assets) == 0:
+        raise ValueError("None of the requested assets were returned.")
+
+    prices = prices[available_assets].copy()
     prices = prices.sort_index().ffill().dropna()
 
     if prices.empty:
         raise ValueError("Price dataframe is empty after cleaning.")
 
     return prices
+
 
 @st.cache_data
 def get_return_inputs(prices):
@@ -75,48 +95,6 @@ def get_return_inputs(prices):
 
     return returns, annual_returns, annual_cov
 
-ASSETS = ["XLK", "XLF", "XLV", "XLE", "XLY", "EEM", "LQD", "IEF", "VNQ", "GLD", "SHY"]
-
-ASSET_CLASS_GROUPS = {
-    "Equity": [0, 1, 2, 3, 4, 5],   # XLK, XLF, XLV, XLE, XLY, EEM
-    "Corporate Debt": [6],          # LQD
-    "Government Debt": [7],         # IEF
-    "Real Estate": [8],             # VNQ
-    "Gold": [9],                    # GLD
-    "Cash": [10]                    # SHY
-}
-
-MIN_CLASS_WEIGHT = 0.02
-
-# -----------------------------
-# ASSET LEVEL METRICS TABLE
-# -----------------------------
-
-# Individual asset risk (volatility)
-asset_vol = np.sqrt(np.diag(annual_cov.values))
-
-# Build table
-weights_table = pd.DataFrame({
-    "Asset": ASSETS,
-    "Weight": opt_weights,
-    "Expected Return": annual_returns.values,
-    "Volatility": asset_vol
-})
-
-# Contribution to return
-weights_table["Return Contribution"] = weights_table["Weight"] * weights_table["Expected Return"]
-
-# Contribution to risk (approximate)
-weights_table["Risk Contribution"] = weights_table["Weight"] * weights_table["Volatility"]
-
-# Clean formatting
-weights_table = weights_table.sort_values("Weight", ascending=False)
-
-weights_table["Weight"] = weights_table["Weight"].round(4)
-weights_table["Expected Return"] = (weights_table["Expected Return"] * 100).round(2)
-weights_table["Volatility"] = (weights_table["Volatility"] * 100).round(2)
-weights_table["Return Contribution"] = (weights_table["Return Contribution"] * 100).round(2)
-weights_table["Risk Contribution"] = (weights_table["Risk Contribution"] * 100).round(2)
 
 # -----------------------------
 # PORTFOLIO FUNCTIONS
@@ -124,8 +102,10 @@ weights_table["Risk Contribution"] = (weights_table["Risk Contribution"] * 100).
 def portfolio_return(weights, annual_returns):
     return np.dot(weights, annual_returns)
 
+
 def portfolio_volatility(weights, annual_cov):
     return np.sqrt(np.dot(weights.T, np.dot(annual_cov, weights)))
+
 
 def sharpe_ratio(weights, annual_returns, annual_cov, risk_free_rate=0.0):
     port_ret = portfolio_return(weights, annual_returns)
@@ -134,7 +114,24 @@ def sharpe_ratio(weights, annual_returns, annual_cov, risk_free_rate=0.0):
         return 0
     return (port_ret - risk_free_rate) / port_vol
 
-def max_return_for_target_risk(annual_returns, annual_cov, target_risk):
+
+def build_class_constraints(asset_names):
+    constraints = []
+
+    for _, idxs in ASSET_CLASS_GROUPS.items():
+        valid_idxs = [i for i in idxs if i < len(asset_names)]
+        if valid_idxs:
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda w, idxs=valid_idxs: np.sum(w[idxs]) - MIN_CLASS_WEIGHT
+                }
+            )
+
+    return constraints
+
+
+def max_return_for_target_risk(annual_returns, annual_cov, target_risk, asset_names):
     n = len(annual_returns)
     init_guess = np.ones(n) / n
     bounds = tuple((0, 1) for _ in range(n))
@@ -144,11 +141,7 @@ def max_return_for_target_risk(annual_returns, annual_cov, target_risk):
         {"type": "eq", "fun": lambda w: portfolio_volatility(w, annual_cov) - target_risk},
     ]
 
-    # Minimum 2% in each asset class
-    for _, idxs in ASSET_CLASS_GROUPS.items():
-        constraints.append(
-            {"type": "ineq", "fun": lambda w, idxs=idxs: np.sum(w[idxs]) - MIN_CLASS_WEIGHT}
-        )
+    constraints.extend(build_class_constraints(asset_names))
 
     result = minimize(
         lambda w: -portfolio_return(w, annual_returns),
@@ -159,7 +152,8 @@ def max_return_for_target_risk(annual_returns, annual_cov, target_risk):
     )
     return result
 
-def min_risk_for_target_return(annual_returns, annual_cov, target_return):
+
+def min_risk_for_target_return(annual_returns, annual_cov, target_return, asset_names):
     n = len(annual_returns)
     init_guess = np.ones(n) / n
     bounds = tuple((0, 1) for _ in range(n))
@@ -169,11 +163,7 @@ def min_risk_for_target_return(annual_returns, annual_cov, target_return):
         {"type": "eq", "fun": lambda w: portfolio_return(w, annual_returns) - target_return},
     ]
 
-    # Minimum 2% in each asset class
-    for _, idxs in ASSET_CLASS_GROUPS.items():
-        constraints.append(
-            {"type": "ineq", "fun": lambda w, idxs=idxs: np.sum(w[idxs]) - MIN_CLASS_WEIGHT}
-        )
+    constraints.extend(build_class_constraints(asset_names))
 
     result = minimize(
         lambda w: portfolio_volatility(w, annual_cov),
@@ -184,6 +174,7 @@ def min_risk_for_target_return(annual_returns, annual_cov, target_return):
     )
     return result
 
+
 def equal_weight_portfolio(annual_returns, annual_cov):
     n = len(annual_returns)
     weights = np.ones(n) / n
@@ -192,10 +183,12 @@ def equal_weight_portfolio(annual_returns, annual_cov):
     sharpe = ret / vol if vol != 0 else np.nan
     return weights, ret, vol, sharpe
 
+
 def compute_portfolio_timeseries(weights, returns_df):
     port_returns = returns_df.dot(weights)
     port_value = (1 + port_returns).cumprod()
     return port_returns, port_value
+
 
 def compute_metrics(portfolio_returns, portfolio_values):
     cumulative_return = portfolio_values.iloc[-1] - 1
@@ -214,6 +207,31 @@ def compute_metrics(portfolio_returns, portfolio_values):
         "Sharpe Ratio": sharpe,
         "Max Drawdown": max_drawdown
     }
+
+
+def build_weights_table(asset_names, opt_weights, annual_returns, annual_cov):
+    asset_vol = np.sqrt(np.diag(annual_cov))
+
+    weights_table = pd.DataFrame({
+        "Asset": asset_names,
+        "Weight": opt_weights,
+        "Expected Return": annual_returns,
+        "Volatility": asset_vol
+    })
+
+    weights_table["Return Contribution"] = weights_table["Weight"] * weights_table["Expected Return"]
+    weights_table["Risk Contribution"] = weights_table["Weight"] * weights_table["Volatility"]
+
+    weights_table = weights_table.sort_values("Weight", ascending=False).reset_index(drop=True)
+
+    weights_table["Weight"] = weights_table["Weight"].round(4)
+    weights_table["Expected Return"] = (weights_table["Expected Return"] * 100).round(2)
+    weights_table["Volatility"] = (weights_table["Volatility"] * 100).round(2)
+    weights_table["Return Contribution"] = (weights_table["Return Contribution"] * 100).round(2)
+    weights_table["Risk Contribution"] = (weights_table["Risk Contribution"] * 100).round(2)
+
+    return weights_table
+
 
 # -----------------------------
 # UI
@@ -246,21 +264,35 @@ if run_btn:
 
         returns_df, annual_returns, annual_cov = get_return_inputs(prices)
 
+        asset_names = list(prices.columns)
+        annual_returns_np = annual_returns.values
+        annual_cov_np = annual_cov.values
+
         if objective == "Highest return for chosen risk":
-            result = max_return_for_target_risk(annual_returns.values, annual_cov.values, target_risk)
+            result = max_return_for_target_risk(
+                annual_returns_np,
+                annual_cov_np,
+                target_risk,
+                asset_names
+            )
         else:
-            result = min_risk_for_target_return(annual_returns.values, annual_cov.values, target_return)
+            result = min_risk_for_target_return(
+                annual_returns_np,
+                annual_cov_np,
+                target_return,
+                asset_names
+            )
 
         if not result.success:
-            st.error("Optimization failed. Try a different target risk/return.")
+            st.error(f"Optimization failed: {result.message}")
             st.stop()
 
         opt_weights = result.x
-        opt_ret = portfolio_return(opt_weights, annual_returns.values)
-        opt_vol = portfolio_volatility(opt_weights, annual_cov.values)
+        opt_ret = portfolio_return(opt_weights, annual_returns_np)
+        opt_vol = portfolio_volatility(opt_weights, annual_cov_np)
         opt_sharpe = opt_ret / opt_vol if opt_vol != 0 else np.nan
 
-        eq_weights, eq_ret, eq_vol, eq_sharpe = equal_weight_portfolio(annual_returns.values, annual_cov.values)
+        eq_weights, eq_ret, eq_vol, eq_sharpe = equal_weight_portfolio(annual_returns_np, annual_cov_np)
 
         opt_port_returns, opt_port_values = compute_portfolio_timeseries(opt_weights, returns_df)
         eq_port_returns, eq_port_values = compute_portfolio_timeseries(eq_weights, returns_df)
@@ -274,9 +306,16 @@ if run_btn:
         ).round(4)
 
         weights_df = pd.DataFrame({
-            "Asset": ASSETS,
+            "Asset": asset_names,
             "Optimized Weight": opt_weights
         }).sort_values("Optimized Weight", ascending=False)
+
+        weights_table = build_weights_table(
+            asset_names,
+            opt_weights,
+            annual_returns_np,
+            annual_cov_np
+        )
 
         st.subheader("Optimal Allocation with Risk & Return")
         st.dataframe(weights_table, use_container_width=True)
