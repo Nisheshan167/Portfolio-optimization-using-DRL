@@ -89,6 +89,36 @@ ASSET_CLASS_GROUPS = {
 MIN_CLASS_WEIGHT = 0.02
 
 # -----------------------------
+# ASSET LEVEL METRICS TABLE
+# -----------------------------
+
+# Individual asset risk (volatility)
+asset_vol = np.sqrt(np.diag(annual_cov.values))
+
+# Build table
+weights_table = pd.DataFrame({
+    "Asset": ASSETS,
+    "Weight": opt_weights,
+    "Expected Return": annual_returns.values,
+    "Volatility": asset_vol
+})
+
+# Contribution to return
+weights_table["Return Contribution"] = weights_table["Weight"] * weights_table["Expected Return"]
+
+# Contribution to risk (approximate)
+weights_table["Risk Contribution"] = weights_table["Weight"] * weights_table["Volatility"]
+
+# Clean formatting
+weights_table = weights_table.sort_values("Weight", ascending=False)
+
+weights_table["Weight"] = weights_table["Weight"].round(4)
+weights_table["Expected Return"] = (weights_table["Expected Return"] * 100).round(2)
+weights_table["Volatility"] = (weights_table["Volatility"] * 100).round(2)
+weights_table["Return Contribution"] = (weights_table["Return Contribution"] * 100).round(2)
+weights_table["Risk Contribution"] = (weights_table["Risk Contribution"] * 100).round(2)
+
+# -----------------------------
 # PORTFOLIO FUNCTIONS
 # -----------------------------
 def portfolio_return(weights, annual_returns):
@@ -248,8 +278,8 @@ if run_btn:
             "Optimized Weight": opt_weights
         }).sort_values("Optimized Weight", ascending=False)
 
-        st.subheader("Optimal Weights")
-        st.dataframe(weights_df.round(4), use_container_width=True)
+        st.subheader("Optimal Allocation with Risk & Return")
+        st.dataframe(weights_table, use_container_width=True)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Optimized Annual Return", f"{opt_ret:.2%}")
