@@ -3,116 +3,14 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import gymnasium as gym
-from gymnasium import spaces
-from stable_baselines3 import PPO
+from scipy.optimize import minimize
 
-st.set_page_config(page_title="DRL Portfolio Optimization", layout="wide")
+st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
-# -----------------------------
-# CONFIG
-# -----------------------------
 ASSETS = ["XLK", "XLF", "XLV", "XLE", "XLY", "EEM", "LQD", "IEF", "VNQ", "GLD", "SHY"]
 
 # -----------------------------
-# ENVIRONMENT
-# -----------------------------
-class PortfolioEnv(gym.Env):
-    def __init__(self, features_df, returns_df, asset_names, transaction_cost=0.001):
-        super(PortfolioEnv, self).__init__()
-
-        self.features_df = features_df.copy()
-        self.returns_df = returns_df.copy()
-        self.asset_names = asset_names
-        self.n_assets = len(asset_names)
-        self.transaction_cost = transaction_cost
-
-        self.returns_df = self.returns_df.loc[self.features_df.index]
-
-        self.features = self.features_df.values
-        self.asset_returns = self.returns_df[self.asset_names].values
-        self.dates = self.features_df.index
-
-        self.action_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(self.n_assets,),
-            dtype=np.float32
-        )
-
-        self.n_features = self.features.shape[1]
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.n_features + self.n_assets,),
-            dtype=np.float32
-        )
-
-        self.reset()
-
-    def _normalize_weights(self, action):
-        action = np.clip(action, 0, 1)
-        total = np.sum(action)
-        if total == 0:
-            return np.ones(self.n_assets) / self.n_assets
-        return action / total
-
-    def _get_observation(self):
-        current_features = self.features[self.current_step]
-        obs = np.concatenate([current_features, self.prev_weights])
-        return obs.astype(np.float32)
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_step = 0
-        self.prev_weights = np.ones(self.n_assets) / self.n_assets
-        self.portfolio_value = 1.0
-        self.portfolio_history = [self.portfolio_value]
-        self.weight_history = [self.prev_weights.copy()]
-        self.reward_history = []
-
-        observation = self._get_observation()
-        info = {}
-        return observation, info
-
-    def step(self, action):
-        weights = self._normalize_weights(action)
-        current_asset_returns = self.asset_returns[self.current_step]
-
-        portfolio_return = np.dot(weights, current_asset_returns)
-        turnover = np.sum(np.abs(weights - self.prev_weights))
-        cost = self.transaction_cost * turnover
-        reward = portfolio_return - cost
-
-        self.portfolio_value *= (1 + reward)
-
-        self.portfolio_history.append(self.portfolio_value)
-        self.weight_history.append(weights.copy())
-        self.reward_history.append(reward)
-
-        self.prev_weights = weights
-        self.current_step += 1
-
-        terminated = self.current_step >= len(self.features) - 1
-        truncated = False
-
-        if not terminated:
-            observation = self._get_observation()
-        else:
-            observation = np.zeros(self.n_features + self.n_assets, dtype=np.float32)
-
-        info = {
-            "portfolio_value": self.portfolio_value,
-            "portfolio_return": portfolio_return,
-            "transaction_cost": cost,
-            "turnover": turnover,
-            "weights": weights
-        }
-
-        return observation, reward, terminated, truncated, info
-
-# -----------------------------
-# HELPERS
+# DATA
 # -----------------------------
 @st.cache_data
 def download_prices(assets, start_date, end_date):
@@ -124,179 +22,207 @@ def download_prices(assets, start_date, end_date):
         progress=False
     )
 
-    prices = data.xs("Close", axis=1, level="Price")
+    # Handle MultiIndex safely
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data.xs("Close", axis=1, level=1)
+    else:
+        prices = data.copy()
+
     prices = prices[assets]
-    prices = prices.sort_index()
-    prices = prices.dropna(how="all")
-    prices = prices.ffill().dropna()
+    prices = prices.sort_index().ffill().dropna()
     return prices
 
 @st.cache_data
-def build_features(prices, start_date, end_date):
-    asset_returns = prices.pct_change().dropna()
-    volatility = asset_returns.rolling(window=20).std()
-    momentum = prices.pct_change(periods=20)
+def get_return_inputs(prices):
+    returns = prices.pct_change().dropna()
+    mean_daily_returns = returns.mean()
+    cov_daily = returns.cov()
 
-    vix = yf.download("^VIX", start=start_date, end=end_date, progress=False)
+    annual_returns = mean_daily_returns * 252
+    annual_cov = cov_daily * 252
 
-    if isinstance(vix.columns, pd.MultiIndex):
-        vix = vix.xs("Close", axis=1, level=-1).squeeze()
-    else:
-        vix = vix["Close"]
+    return returns, annual_returns, annual_cov
 
-    vix = vix.reindex(prices.index)
-    vix = vix.ffill()
+# -----------------------------
+# PORTFOLIO FUNCTIONS
+# -----------------------------
+def portfolio_return(weights, annual_returns):
+    return np.dot(weights, annual_returns)
 
-    returns_feat = asset_returns.copy()
-    volatility_feat = volatility.copy()
-    momentum_feat = momentum.copy()
+def portfolio_volatility(weights, annual_cov):
+    return np.sqrt(np.dot(weights.T, np.dot(annual_cov, weights)))
 
-    returns_feat.columns = [f"{col}_ret" for col in returns_feat.columns]
-    volatility_feat.columns = [f"{col}_vol" for col in volatility_feat.columns]
-    momentum_feat.columns = [f"{col}_mom" for col in momentum_feat.columns]
+def sharpe_ratio(weights, annual_returns, annual_cov, risk_free_rate=0.0):
+    port_ret = portfolio_return(weights, annual_returns)
+    port_vol = portfolio_volatility(weights, annual_cov)
+    if port_vol == 0:
+        return 0
+    return (port_ret - risk_free_rate) / port_vol
 
-    features = pd.concat([returns_feat, volatility_feat, momentum_feat], axis=1)
-    features["VIX"] = vix
-    features = features.dropna()
+def max_return_for_target_risk(annual_returns, annual_cov, target_risk):
+    n = len(annual_returns)
+    init_guess = np.ones(n) / n
+    bounds = tuple((0, 1) for _ in range(n))
 
-    asset_returns = asset_returns.loc[features.index]
-    return features, asset_returns
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+        {"type": "eq", "fun": lambda w: portfolio_volatility(w, annual_cov) - target_risk}
+    ]
 
-def compute_metrics(portfolio_series, freq=252):
-    returns = portfolio_series.pct_change().dropna()
+    result = minimize(
+        lambda w: -portfolio_return(w, annual_returns),
+        init_guess,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+    return result
 
-    cumulative_return = portfolio_series.iloc[-1] / portfolio_series.iloc[0] - 1
-    annual_return = (1 + cumulative_return) ** (freq / len(returns)) - 1
-    annual_vol = returns.std() * np.sqrt(freq)
-    sharpe = annual_return / annual_vol if annual_vol != 0 else np.nan
+def min_risk_for_target_return(annual_returns, annual_cov, target_return):
+    n = len(annual_returns)
+    init_guess = np.ones(n) / n
+    bounds = tuple((0, 1) for _ in range(n))
 
-    running_max = portfolio_series.cummax()
-    drawdown = portfolio_series / running_max - 1
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+        {"type": "eq", "fun": lambda w: portfolio_return(w, annual_returns) - target_return}
+    ]
+
+    result = minimize(
+        lambda w: portfolio_volatility(w, annual_cov),
+        init_guess,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+    return result
+
+def equal_weight_portfolio(annual_returns, annual_cov):
+    n = len(annual_returns)
+    weights = np.ones(n) / n
+    ret = portfolio_return(weights, annual_returns)
+    vol = portfolio_volatility(weights, annual_cov)
+    sharpe = ret / vol if vol != 0 else np.nan
+    return weights, ret, vol, sharpe
+
+def compute_portfolio_timeseries(weights, returns_df):
+    port_returns = returns_df.dot(weights)
+    port_value = (1 + port_returns).cumprod()
+    return port_returns, port_value
+
+def compute_metrics(portfolio_returns, portfolio_values):
+    cumulative_return = portfolio_values.iloc[-1] - 1
+    annual_return = portfolio_returns.mean() * 252
+    annual_volatility = portfolio_returns.std() * np.sqrt(252)
+    sharpe = annual_return / annual_volatility if annual_volatility != 0 else np.nan
+
+    running_max = portfolio_values.cummax()
+    drawdown = portfolio_values / running_max - 1
     max_drawdown = drawdown.min()
 
     return {
         "Cumulative Return": cumulative_return,
         "Annual Return": annual_return,
-        "Annual Volatility": annual_vol,
+        "Annual Volatility": annual_volatility,
         "Sharpe Ratio": sharpe,
         "Max Drawdown": max_drawdown
     }
 
-def run_model_on_env(model, env):
-    obs, info = env.reset()
-    done = False
-    portfolio_values = [env.portfolio_value]
-    weights_history = []
-
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-
-        portfolio_values.append(info["portfolio_value"])
-        weights_history.append(info["weights"])
-
-    return portfolio_values, weights_history
-
 # -----------------------------
 # UI
 # -----------------------------
-st.title("DRL Portfolio Optimization Dashboard")
-st.write("PPO-based portfolio allocation across sector ETFs, bonds, gold, REITs, emerging markets, and cash.")
+st.title("Portfolio Optimizer")
+st.write("Find the optimal portfolio for a chosen risk or return target, and compare it against an equal-weight portfolio.")
 
 with st.sidebar:
-    st.header("Settings")
-    start_date = st.date_input("Start Date", pd.to_datetime("2014-01-01"))
+    st.header("Inputs")
+
+    start_date = st.date_input("Start Date", pd.to_datetime("2018-01-01"))
     end_date = st.date_input("End Date", pd.to_datetime("2026-01-01"))
-    split_ratio = st.slider("Train/Test Split", min_value=0.6, max_value=0.9, value=0.8, step=0.05)
-    transaction_cost = st.number_input("Transaction Cost", min_value=0.0, max_value=0.01, value=0.001, step=0.0005)
-    model_path = st.text_input("Saved PPO Model Path", value="ppo_portfolio_model.zip")
-    run_btn = st.button("Run Analysis")
+
+    objective = st.radio(
+        "Optimization Goal",
+        ["Highest return for chosen risk", "Lowest risk for chosen return"]
+    )
+
+    if objective == "Highest return for chosen risk":
+        target_risk = st.slider("Target Annual Volatility", 0.03, 0.30, 0.12, 0.005)
+    else:
+        target_return = st.slider("Target Annual Return", 0.02, 0.25, 0.10, 0.005)
+
+    run_btn = st.button("Optimize Portfolio")
 
 if run_btn:
     try:
-        with st.spinner("Downloading price data..."):
+        with st.spinner("Downloading data..."):
             prices = download_prices(ASSETS, str(start_date), str(end_date))
 
-        with st.spinner("Building features..."):
-            features, asset_returns = build_features(prices, str(start_date), str(end_date))
+        returns_df, annual_returns, annual_cov = get_return_inputs(prices)
 
-        split_idx = int(len(features) * split_ratio)
+        if objective == "Highest return for chosen risk":
+            result = max_return_for_target_risk(annual_returns.values, annual_cov.values, target_risk)
+        else:
+            result = min_risk_for_target_return(annual_returns.values, annual_cov.values, target_return)
 
-        train_features = features.iloc[:split_idx]
-        test_features = features.iloc[split_idx:]
+        if not result.success:
+            st.error("Optimization failed. Try a different target risk/return.")
+            st.stop()
 
-        train_returns = asset_returns.iloc[:split_idx]
-        test_returns = asset_returns.iloc[split_idx:]
+        opt_weights = result.x
+        opt_ret = portfolio_return(opt_weights, annual_returns.values)
+        opt_vol = portfolio_volatility(opt_weights, annual_cov.values)
+        opt_sharpe = opt_ret / opt_vol if opt_vol != 0 else np.nan
 
-        test_env = PortfolioEnv(
-            features_df=test_features,
-            returns_df=test_returns,
-            asset_names=ASSETS,
-            transaction_cost=transaction_cost
-        )
+        eq_weights, eq_ret, eq_vol, eq_sharpe = equal_weight_portfolio(annual_returns.values, annual_cov.values)
 
-        with st.spinner("Loading trained PPO model..."):
-            model = PPO.load(model_path)
+        opt_port_returns, opt_port_values = compute_portfolio_timeseries(opt_weights, returns_df)
+        eq_port_returns, eq_port_values = compute_portfolio_timeseries(eq_weights, returns_df)
 
-        with st.spinner("Running DRL portfolio..."):
-            drl_values, weights_history = run_model_on_env(model, test_env)
+        opt_metrics = compute_metrics(opt_port_returns, opt_port_values)
+        eq_metrics = compute_metrics(eq_port_returns, eq_port_values)
 
-        drl_series = pd.Series(drl_values, name="DRL").reset_index(drop=True)
+        metrics_df = pd.DataFrame(
+            [opt_metrics, eq_metrics],
+            index=["Optimized Portfolio", "Equal Weight"]
+        ).round(4)
 
-        eq_weights = np.ones(len(ASSETS)) / len(ASSETS)
-        eq_returns = (test_returns[ASSETS] * eq_weights).sum(axis=1)
-        eq_values = (1 + eq_returns).cumprod()
-        eq_series = pd.Series(eq_values.values, name="Equal Weight").reset_index(drop=True)
+        weights_df = pd.DataFrame({
+            "Asset": ASSETS,
+            "Optimized Weight": opt_weights
+        }).sort_values("Optimized Weight", ascending=False)
 
-        min_len = min(len(drl_series), len(eq_series))
-        drl_series = drl_series.iloc[:min_len]
-        eq_series = eq_series.iloc[:min_len]
+        st.subheader("Optimal Weights")
+        st.dataframe(weights_df.round(4), use_container_width=True)
 
-        drl_metrics = compute_metrics(drl_series)
-        eq_metrics = compute_metrics(eq_series)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Optimized Annual Return", f"{opt_ret:.2%}")
+        c2.metric("Optimized Annual Volatility", f"{opt_vol:.2%}")
+        c3.metric("Optimized Sharpe Ratio", f"{opt_sharpe:.2f}")
 
-        metrics_df = pd.DataFrame([drl_metrics, eq_metrics], index=["DRL", "Equal Weight"])
-        metrics_df = metrics_df.applymap(lambda x: round(x, 4) if pd.notnull(x) else x)
-
-        st.subheader("Performance Metrics")
+        st.subheader("Comparison with Equal-Weight Portfolio")
         st.dataframe(metrics_df, use_container_width=True)
 
-        st.subheader("Portfolio Value Comparison")
+        st.subheader("Growth of $1")
         fig1, ax1 = plt.subplots(figsize=(12, 5))
-        ax1.plot(drl_series, label="DRL Portfolio")
-        ax1.plot(eq_series, label="Equal Weight Portfolio")
-        ax1.set_title("DRL vs Equal Weight")
-        ax1.set_xlabel("Step")
+        ax1.plot(opt_port_values.index, opt_port_values.values, label="Optimized Portfolio")
+        ax1.plot(eq_port_values.index, eq_port_values.values, label="Equal Weight Portfolio")
+        ax1.set_title("Optimized vs Equal Weight Portfolio")
+        ax1.set_xlabel("Date")
         ax1.set_ylabel("Portfolio Value")
         ax1.legend()
         ax1.grid(True)
         st.pyplot(fig1)
 
-        weights_df = pd.DataFrame(weights_history, columns=ASSETS)
-
-        st.subheader("Portfolio Weights Over Time")
-        fig2, ax2 = plt.subplots(figsize=(14, 6))
-        for col in weights_df.columns:
-            ax2.plot(weights_df[col], label=col)
-        ax2.set_title("DRL Portfolio Weights")
-        ax2.set_xlabel("Step")
+        st.subheader("Weight Allocation")
+        fig2, ax2 = plt.subplots(figsize=(10, 5))
+        ax2.bar(weights_df["Asset"], weights_df["Optimized Weight"])
+        ax2.set_title("Optimized Portfolio Weights")
+        ax2.set_xlabel("Asset")
         ax2.set_ylabel("Weight")
-        ax2.legend(loc="upper right", ncol=3)
-        ax2.grid(True)
+        ax2.grid(True, axis="y")
         st.pyplot(fig2)
 
-        st.subheader("Latest Recommended Weights")
-        latest_weights = pd.DataFrame({
-            "Asset": ASSETS,
-            "Weight": weights_df.iloc[-1].values
-        }).sort_values("Weight", ascending=False)
-        latest_weights["Weight"] = latest_weights["Weight"].round(4)
-        st.dataframe(latest_weights, use_container_width=True)
-
-    except FileNotFoundError:
-        st.error("Saved PPO model file not found. Make sure the model path is correct.")
     except Exception as e:
         st.error(f"Error: {e}")
 else:
-    st.info("Set your parameters in the sidebar and click Run Analysis.")
+    st.info("Choose the user objective in the sidebar and click 'Optimize Portfolio'.")
