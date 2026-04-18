@@ -22,14 +22,46 @@ def download_prices(assets, start_date, end_date):
         progress=False
     )
 
-    # Handle MultiIndex safely
+    # Case 1: MultiIndex columns
     if isinstance(data.columns, pd.MultiIndex):
-        prices = data.xs("Close", axis=1, level=1)
-    else:
-        prices = data.copy()
+        level0 = list(data.columns.get_level_values(0))
+        level1 = list(data.columns.get_level_values(1))
 
-    prices = prices[assets]
+        # Format like: ('Ticker', 'Close')
+        if "Close" in level1:
+            prices = data.xs("Close", axis=1, level=1)
+
+        # Format like: ('Close', 'Ticker')
+        elif "Close" in level0:
+            prices = data.xs("Close", axis=1, level=0)
+
+        else:
+            raise ValueError(f"'Close' not found in MultiIndex columns: {data.columns}")
+
+    # Case 2: Single-level columns
+    else:
+        if "Close" in data.columns:
+            prices = data[["Close"]].copy()
+
+            # If only one asset, rename Close -> ticker
+            if len(assets) == 1:
+                prices.columns = assets
+        else:
+            raise ValueError(f"'Close' not found in columns: {data.columns}")
+
+    # Keep only requested assets that actually exist
+    available_assets = [a for a in assets if a in prices.columns]
+    missing_assets = [a for a in assets if a not in prices.columns]
+
+    if missing_assets:
+        st.warning(f"These assets were not returned and were skipped: {missing_assets}")
+
+    prices = prices[available_assets]
     prices = prices.sort_index().ffill().dropna()
+
+    if prices.empty:
+        raise ValueError("Price dataframe is empty after cleaning.")
+
     return prices
 
 @st.cache_data
