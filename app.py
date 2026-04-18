@@ -178,7 +178,7 @@ with st.sidebar:
     )
 
     if objective == "Highest return for chosen risk":
-        target_risk = st.slider("Target Annual Volatility", 0.03, 0.50, 0.12, 0.005)
+        target_risk = st.slider("Target Annual Volatility", 0.03, 0.30, 0.12, 0.005)
     else:
         target_return = st.slider("Target Annual Return", 0.02, 0.23, 0.10, 0.005)
 
